@@ -38,7 +38,26 @@ def load_model(checkpoint_path, device):
     
     # Create model
     model = SalesPredictor(num_features, **config)
-    model.load_state_dict(checkpoint['model_state_dict'])
+    
+    # Try to load state dict
+    try:
+        model.load_state_dict(checkpoint['model_state_dict'])
+        print("Model loaded successfully with new structure")
+    except RuntimeError as e:
+        print(f"Warning: Model structure mismatch. Error: {e}")
+        print("This model was trained with old structure. Consider retraining for better performance.")
+        # Load what we can, ignore mismatched layers
+        model_dict = model.state_dict()
+        pretrained_dict = checkpoint['model_state_dict']
+        
+        # Filter out mismatched keys
+        pretrained_dict = {k: v for k, v in pretrained_dict.items() 
+                          if k in model_dict and model_dict[k].shape == v.shape}
+        
+        model_dict.update(pretrained_dict)
+        model.load_state_dict(model_dict, strict=False)
+        print(f"Partially loaded {len(pretrained_dict)}/{len(model_dict)} parameters")
+    
     model = model.to(device)
     model.eval()
     
@@ -47,6 +66,7 @@ def load_model(checkpoint_path, device):
 def prepare_input_sequence(test_df, feature_cols):
     """Prepare last 28 days of data for each restaurant_menu"""
     sequences = {}
+    future_features_dict = {}
     
     grouped = test_df.groupby('restaurant_menu')
     for name, group in grouped:
@@ -56,6 +76,36 @@ def prepare_input_sequence(test_df, feature_cols):
         if len(group) >= 28:
             last_28_days = group.tail(28)[feature_cols].values
             sequences[name] = torch.FloatTensor(last_28_days).unsqueeze(0)  # Add batch dimension
+            
+            # Prepare future features for next 7 days
+            last_day_features = last_28_days[-1].copy()
+            future_features = []
+            
+            # Get last date to calculate weekdays
+            last_date = group.iloc[-1]['date']
+            
+            for day in range(7):
+                # Copy last day's features
+                future_day_features = last_day_features.copy()
+                
+                # Update weekday encoding
+                # First, reset all weekday columns to 0
+                weekday_cols = [i for i, col in enumerate(feature_cols) if col.startswith('weekday_')]
+                for idx in weekday_cols:
+                    future_day_features[idx] = 0
+                
+                # Set the correct weekday to 1
+                future_date = last_date + pd.Timedelta(days=day+1)
+                weekday_idx = [i for i, col in enumerate(feature_cols) if col == f'weekday_{future_date.dayofweek}'][0]
+                future_day_features[weekday_idx] = 1
+                
+                # Sales count will be updated during prediction
+                future_day_features[0] = 0  # Reset sales_count_norm
+                
+                future_features.append(future_day_features)
+            
+            future_features_dict[name] = torch.FloatTensor(np.array(future_features)).unsqueeze(0)
+            
         else:
             print(f"Warning: {name} has less than 28 days of data ({len(group)} days)")
             # Pad with zeros if less than 28 days
@@ -63,8 +113,30 @@ def prepare_input_sequence(test_df, feature_cols):
             data = group[feature_cols].values
             padded_data = np.vstack([np.zeros((padding_size, len(feature_cols))), data])
             sequences[name] = torch.FloatTensor(padded_data).unsqueeze(0)
+            
+            # Create future features even for padded sequences
+            if len(data) > 0:
+                last_day_features = data[-1].copy()
+            else:
+                last_day_features = np.zeros(len(feature_cols))
+            
+            future_features = []
+            last_date = group.iloc[-1]['date'] if len(group) > 0 else pd.Timestamp('2024-06-16')
+            
+            for day in range(7):
+                future_day_features = last_day_features.copy()
+                weekday_cols = [i for i, col in enumerate(feature_cols) if col.startswith('weekday_')]
+                for idx in weekday_cols:
+                    future_day_features[idx] = 0
+                future_date = last_date + pd.Timedelta(days=day+1)
+                weekday_idx = [i for i, col in enumerate(feature_cols) if col == f'weekday_{future_date.dayofweek}'][0]
+                future_day_features[weekday_idx] = 1
+                future_day_features[0] = 0
+                future_features.append(future_day_features)
+            
+            future_features_dict[name] = torch.FloatTensor(np.array(future_features)).unsqueeze(0)
     
-    return sequences
+    return sequences, future_features_dict
 
 def denormalize_predictions(predictions, menu_scalers, restaurant_menu_list):
     """Denormalize predictions back to original scale"""
@@ -155,17 +227,18 @@ def main(args):
         # Get feature columns (excluding date and restaurant_menu)
         feature_cols = [col for col in test_df.columns if col not in ['date', 'restaurant_menu']]
         
-        # Prepare input sequences
-        input_sequences = prepare_input_sequence(test_df, feature_cols)
+        # Prepare input sequences and future features
+        input_sequences, future_features_dict = prepare_input_sequence(test_df, feature_cols)
         
         # Make predictions
         predictions = {}
         with torch.no_grad():
             for restaurant_menu, input_seq in tqdm(input_sequences.items(), desc="Predicting"):
                 input_seq = input_seq.to(device)
+                future_features = future_features_dict[restaurant_menu].to(device)
                 
-                # Model prediction
-                output = model(input_seq, target=None, teacher_forcing_ratio=0)
+                # Model prediction with future features
+                output = model(input_seq, target=None, teacher_forcing_ratio=0, future_features=future_features)
                 output = output.squeeze().cpu().numpy()
                 
                 predictions[restaurant_menu] = output

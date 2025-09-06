@@ -74,13 +74,20 @@ def train_epoch(model, dataloader, optimizer, criterion, scheduler, device, teac
     
     progress_bar = tqdm(dataloader, desc='Training')
     
-    for batch_idx, (inputs, targets) in enumerate(progress_bar):
+    for batch_idx, batch_data in enumerate(progress_bar):
+        if len(batch_data) == 3:
+            inputs, targets, future_features = batch_data
+            future_features = future_features.to(device)
+        else:
+            inputs, targets = batch_data
+            future_features = None
+        
         inputs = inputs.to(device)
         targets = targets.to(device)
         
         optimizer.zero_grad()
         
-        outputs = model(inputs, targets, teacher_forcing_ratio)
+        outputs = model(inputs, targets, teacher_forcing_ratio, future_features=future_features)
         
         loss = criterion(outputs, targets)
         smape = calculate_smape(outputs, targets, exclude_zeros=False)  # Include zeros during training
@@ -113,11 +120,18 @@ def evaluate(model, dataloader, criterion, device):
     with torch.no_grad():
         progress_bar = tqdm(dataloader, desc='Evaluating')
         
-        for inputs, targets in progress_bar:
+        for batch_data in progress_bar:
+            if len(batch_data) == 3:
+                inputs, targets, future_features = batch_data
+                future_features = future_features.to(device)
+            else:
+                inputs, targets = batch_data
+                future_features = None
+            
             inputs = inputs.to(device)
             targets = targets.to(device)
             
-            outputs = model(inputs, target=None, teacher_forcing_ratio=0)
+            outputs = model(inputs, target=None, teacher_forcing_ratio=0, future_features=future_features)
             
             loss = criterion(outputs, targets)
             smape = calculate_smape(outputs, targets, exclude_zeros=True)  # Exclude zeros during evaluation

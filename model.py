@@ -83,28 +83,29 @@ class Encoder(nn.Module):
         return outputs, hidden, cell
 
 class Decoder(nn.Module):
-    def __init__(self, output_dim, hidden_dim, num_layers=2, dropout=0.2):
+    def __init__(self, output_dim, hidden_dim, num_features, num_layers=2, dropout=0.2):
         super().__init__()
         self.output_dim = output_dim
         self.hidden_dim = hidden_dim
+        self.num_features = num_features
         self.num_layers = num_layers
         
         self.attention = Attention(hidden_dim)
         
         self.lstm = nn.LSTM(
-            hidden_dim + output_dim,
+            hidden_dim + num_features,
             hidden_dim,
             num_layers,
             batch_first=True,
             dropout=dropout if num_layers > 1 else 0
         )
         
-        self.fc_out = nn.Linear(hidden_dim * 2 + output_dim, output_dim)
+        self.fc_out = nn.Linear(hidden_dim * 2 + num_features, output_dim)
         self.dropout = nn.Dropout(dropout)
         
     def forward(self, input, hidden, cell, encoder_outputs):
         """
-        input: [batch_size, 1, output_dim]
+        input: [batch_size, 1, num_features]
         hidden: [num_layers, batch_size, hidden_dim]
         cell: [num_layers, batch_size, hidden_dim]
         encoder_outputs: [batch_size, seq_len, hidden_dim]
@@ -136,15 +137,16 @@ class SalesPredictor(nn.Module):
         self.output_seq_len = output_seq_len
         
         self.encoder = Encoder(num_features, hidden_dim, num_layers, dropout)
-        self.decoder = Decoder(1, hidden_dim, num_layers, dropout)
+        self.decoder = Decoder(1, hidden_dim, num_features, num_layers, dropout)
         
         self.fc_input = nn.Linear(num_features, num_features)
         self.layer_norm = nn.LayerNorm(num_features)
         
-    def forward(self, x, target=None, teacher_forcing_ratio=0.5):
+    def forward(self, x, target=None, teacher_forcing_ratio=0.5, future_features=None):
         """
         x: [batch_size, input_seq_len, num_features]
         target: [batch_size, output_seq_len] (only for training)
+        future_features: [batch_size, output_seq_len, num_features] (should be provided for both training and inference)
         """
         batch_size = x.size(0)
         
@@ -157,17 +159,31 @@ class SalesPredictor(nn.Module):
         
         outputs = []
         
-        input = x[:, -1:, :1]
+        # If future_features not provided, use last day as fallback (backward compatibility)
+        if future_features is None:
+            last_day_features = x[:, -1:, :]
+            future_features = last_day_features.repeat(1, self.output_seq_len, 1)
         
         for t in range(self.output_seq_len):
-            prediction, hidden, cell, _ = self.decoder(input, hidden, cell, encoder_outputs)
+            # Get future features for day t
+            input_features = future_features[:, t:t+1, :].clone()
+            
+            # Apply teacher forcing only to sales_count (first feature)
+            if t == 0:
+                # First prediction uses last day's actual sales
+                input_features[:, :, 0] = x[:, -1, 0:1]
+            else:
+                # For subsequent days, use teacher forcing or previous prediction
+                if target is not None and torch.rand(1).item() < teacher_forcing_ratio:
+                    # Use actual sales from target
+                    input_features[:, :, 0] = target[:, t-1:t]
+                else:
+                    # Use previous prediction
+                    input_features[:, :, 0] = outputs[-1].squeeze(2)
+            
+            prediction, hidden, cell, _ = self.decoder(input_features, hidden, cell, encoder_outputs)
             
             outputs.append(prediction)
-            
-            if target is not None and torch.rand(1).item() < teacher_forcing_ratio:
-                input = target[:, t:t+1].unsqueeze(2)
-            else:
-                input = prediction
         
         outputs = torch.cat(outputs, dim=1)
         
@@ -205,8 +221,10 @@ class SalesDataset(torch.utils.data.Dataset):
             for i in range(0, len(group) - self.input_seq_len - self.output_seq_len + 1, self.stride):
                 input_seq = group.iloc[i:i + self.input_seq_len][self.feature_cols].values
                 output_seq = group.iloc[i + self.input_seq_len:i + self.input_seq_len + self.output_seq_len]['sales_count_norm'].values
+                # Add future features for the output period
+                future_features = group.iloc[i + self.input_seq_len:i + self.input_seq_len + self.output_seq_len][self.feature_cols].values
                 
-                samples.append((input_seq, output_seq))
+                samples.append((input_seq, output_seq, future_features))
         
         return samples
     
@@ -214,8 +232,8 @@ class SalesDataset(torch.utils.data.Dataset):
         return len(self.samples)
     
     def __getitem__(self, idx):
-        input_seq, output_seq = self.samples[idx]
-        return torch.FloatTensor(input_seq), torch.FloatTensor(output_seq)
+        input_seq, output_seq, future_features = self.samples[idx]
+        return torch.FloatTensor(input_seq), torch.FloatTensor(output_seq), torch.FloatTensor(future_features)
 
 def create_model(num_features, config=None):
     """
