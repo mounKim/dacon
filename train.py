@@ -323,8 +323,8 @@ if __name__ == "__main__":
     parser.add_argument('--stride', type=int, default=1, help='Sliding window stride')
     
     # Model parameters
-    parser.add_argument('--hidden_dim', type=int, default=128, help='Hidden dimension')
-    parser.add_argument('--num_layers', type=int, default=2, help='Number of LSTM layers')
+    parser.add_argument('--hidden_dim', type=int, default=256, help='Hidden dimension')
+    parser.add_argument('--num_layers', type=int, default=3, help='Number of LSTM layers')
     parser.add_argument('--dropout', type=float, default=0.3, help='Dropout rate')
     
     # Training parameters
