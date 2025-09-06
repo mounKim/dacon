@@ -244,8 +244,8 @@ def create_model(num_features, config=None):
         config: optional configuration dictionary
     """
     default_config = {
-        'hidden_dim': 128,
-        'num_layers': 2,
+        'hidden_dim': 256,
+        'num_layers': 3,
         'dropout': 0.2,
         'input_seq_len': 28,
         'output_seq_len': 7

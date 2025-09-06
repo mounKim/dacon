@@ -9,6 +9,8 @@ import pickle
 import warnings
 warnings.filterwarnings('ignore')
 from model import SalesPredictor
+import holidays
+kr_holidays = holidays.KR()
 
 def load_model(checkpoint_path, device):
     """Load trained model from checkpoint"""
@@ -72,70 +74,43 @@ def prepare_input_sequence(test_df, feature_cols):
     for name, group in grouped:
         group = group.sort_values('date').reset_index(drop=True)
         
-        # Take last 28 days
-        if len(group) >= 28:
-            last_28_days = group.tail(28)[feature_cols].values
-            sequences[name] = torch.FloatTensor(last_28_days).unsqueeze(0)  # Add batch dimension
+        last_28_days = group.tail(28)[feature_cols].values
+        sequences[name] = torch.FloatTensor(last_28_days).unsqueeze(0)  # Add batch dimension
+        
+        # Prepare future features for next 7 days
+        last_day_features = last_28_days[-1].copy()
+        future_features = []
+        
+        # Get last date to calculate weekdays
+        last_date = group.iloc[-1]['date']
+        
+        for day in range(7):
+            # Copy last day's features
+            future_day_features = last_day_features.copy()
             
-            # Prepare future features for next 7 days
-            last_day_features = last_28_days[-1].copy()
-            future_features = []
+            # Update weekday encoding
+            # First, reset all weekday columns to 0
+            weekday_cols = [i for i, col in enumerate(feature_cols) if col.startswith('weekday_')]
+            for idx in weekday_cols:
+                future_day_features[idx] = 0
             
-            # Get last date to calculate weekdays
-            last_date = group.iloc[-1]['date']
+            # Set the correct weekday to 1
+            future_date = last_date + pd.Timedelta(days=day+1)
+            weekday_idx = [i for i, col in enumerate(feature_cols) if col == f'weekday_{future_date.dayofweek}'][0]
+            future_day_features[weekday_idx] = 1
             
-            for day in range(7):
-                # Copy last day's features
-                future_day_features = last_day_features.copy()
-                
-                # Update weekday encoding
-                # First, reset all weekday columns to 0
-                weekday_cols = [i for i, col in enumerate(feature_cols) if col.startswith('weekday_')]
-                for idx in weekday_cols:
-                    future_day_features[idx] = 0
-                
-                # Set the correct weekday to 1
-                future_date = last_date + pd.Timedelta(days=day+1)
-                weekday_idx = [i for i, col in enumerate(feature_cols) if col == f'weekday_{future_date.dayofweek}'][0]
-                future_day_features[weekday_idx] = 1
-                
-                # Sales count will be updated during prediction
-                future_day_features[0] = 0  # Reset sales_count_norm
-                
-                future_features.append(future_day_features)
+            # Update holiday feature (1 if holiday or weekend, 0 otherwise)
+            if 'holiday' in feature_cols:
+                holiday_idx = [i for i, col in enumerate(feature_cols) if col == 'holiday'][0]
+                future_day_features[holiday_idx] = 1 if future_date.date() in kr_holidays or future_date.weekday() >= 5 else 0
             
-            future_features_dict[name] = torch.FloatTensor(np.array(future_features)).unsqueeze(0)
+            # Sales count will be updated during prediction
+            future_day_features[0] = 0  # Reset sales_count_norm
             
-        else:
-            print(f"Warning: {name} has less than 28 days of data ({len(group)} days)")
-            # Pad with zeros if less than 28 days
-            padding_size = 28 - len(group)
-            data = group[feature_cols].values
-            padded_data = np.vstack([np.zeros((padding_size, len(feature_cols))), data])
-            sequences[name] = torch.FloatTensor(padded_data).unsqueeze(0)
-            
-            # Create future features even for padded sequences
-            if len(data) > 0:
-                last_day_features = data[-1].copy()
-            else:
-                last_day_features = np.zeros(len(feature_cols))
-            
-            future_features = []
-            last_date = group.iloc[-1]['date'] if len(group) > 0 else pd.Timestamp('2024-06-16')
-            
-            for day in range(7):
-                future_day_features = last_day_features.copy()
-                weekday_cols = [i for i, col in enumerate(feature_cols) if col.startswith('weekday_')]
-                for idx in weekday_cols:
-                    future_day_features[idx] = 0
-                future_date = last_date + pd.Timedelta(days=day+1)
-                weekday_idx = [i for i, col in enumerate(feature_cols) if col == f'weekday_{future_date.dayofweek}'][0]
-                future_day_features[weekday_idx] = 1
-                future_day_features[0] = 0
-                future_features.append(future_day_features)
-            
-            future_features_dict[name] = torch.FloatTensor(np.array(future_features)).unsqueeze(0)
-    
+            future_features.append(future_day_features)
+        
+        future_features_dict[name] = torch.FloatTensor(np.array(future_features)).unsqueeze(0)
+        
     return sequences, future_features_dict
 
 def denormalize_predictions(predictions, menu_scalers, restaurant_menu_list):

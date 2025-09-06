@@ -7,6 +7,8 @@ from datetime import datetime
 import glob
 import os
 from model import RestaurantEmbedding, MenuEmbedding
+import holidays
+kr_holidays = holidays.KR()
 
 def preprocess_data():
     train_df = pd.read_csv('data/train/train.csv')
@@ -31,6 +33,7 @@ def preprocess_data():
     for i in range(7):
         all_df[f'weekday_{i}'] = (all_df['weekday'] == i).astype(int)
     
+    all_df['holiday'] = all_df['date'].apply(lambda x: 1 if x.date() in kr_holidays or x.weekday() >= 5 else 0)
     all_df[['restaurant', 'menu']] = all_df['restaurant_menu'].str.split('_', n=1, expand=True)
     
     unique_restaurants = all_df['restaurant'].unique()
@@ -109,6 +112,7 @@ def preprocess_data():
     
     features = ['sales_count_norm'] + \
                [f'weekday_{i}' for i in range(7)] + \
+               ['holiday'] + \
                [f'restaurant_emb_{i}' for i in range(4)] + \
                [f'menu_emb_{i}' for i in range(4)] + \
                ['avg_temp_norm', 'rainfall_norm']

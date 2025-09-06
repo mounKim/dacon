@@ -251,11 +251,7 @@ def main(args):
     patience_counter = 0
     teacher_forcing_ratio = args.teacher_forcing_start
     
-    print("\nStarting training...")
-    for epoch in range(args.epochs):
-        print(f"\nEpoch {epoch+1}/{args.epochs}")
-        print(f"Teacher forcing ratio: {teacher_forcing_ratio:.3f}")
-        
+    for epoch in range(args.epochs):    
         # Train
         train_loss, train_smape = train_epoch(
             model, train_loader, optimizer, criterion, 
@@ -336,7 +332,7 @@ if __name__ == "__main__":
     parser.add_argument('--dropout', type=float, default=0.2, help='Dropout rate')
     
     # Training parameters
-    parser.add_argument('--epochs', type=int, default=10, help='Number of epochs')
+    parser.add_argument('--epochs', type=int, default=2, help='Number of epochs')
     parser.add_argument('--batch_size', type=int, default=32, help='Batch size')
     parser.add_argument('--lr', type=float, default=1e-3, help='Learning rate')
     parser.add_argument('--weight_decay', type=float, default=0.01, help='Weight decay')
