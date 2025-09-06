@@ -333,7 +333,7 @@ if __name__ == "__main__":
     parser.add_argument('--lr', type=float, default=1e-3, help='Learning rate')
     parser.add_argument('--weight_decay', type=float, default=0.01, help='Weight decay')
     parser.add_argument('--teacher_forcing_start', type=float, default=0.7, help='Initial teacher forcing ratio')
-    parser.add_argument('--use_scheduler', action='store_true', help='Use learning rate scheduler')
+    parser.add_argument('--use_scheduler', action='store_false', help='Use learning rate scheduler')
     parser.add_argument('--patience', type=int, default=10, help='Early stopping patience')
     
     # Other parameters
