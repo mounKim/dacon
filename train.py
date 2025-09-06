@@ -9,7 +9,7 @@ import argparse
 import os
 from datetime import datetime
 import random
-from model import SalesPredictor, SalesDataset
+from model import SalesDataset, create_model
 
 def set_seed(seed=42):
     random.seed(seed)
@@ -75,19 +75,19 @@ def train_epoch(model, dataloader, optimizer, criterion, scheduler, device, teac
     progress_bar = tqdm(dataloader, desc='Training')
     
     for batch_idx, batch_data in enumerate(progress_bar):
-        if len(batch_data) == 3:
-            inputs, targets, future_features = batch_data
-            future_features = future_features.to(device)
-        else:
-            inputs, targets = batch_data
-            future_features = None
+        inputs, targets, future_features, restaurant_idx, menu_idx = batch_data
+        restaurant_idx = restaurant_idx.squeeze(1).to(device)
+        menu_idx = menu_idx.squeeze(1).to(device)
         
         inputs = inputs.to(device)
         targets = targets.to(device)
+        if future_features is not None:
+            future_features = future_features.to(device)
         
         optimizer.zero_grad()
         
-        outputs = model(inputs, targets, teacher_forcing_ratio, future_features=future_features)
+        outputs = model(inputs, targets, teacher_forcing_ratio, future_features=future_features,
+                       restaurant_idx=restaurant_idx, menu_idx=menu_idx)
         
         loss = criterion(outputs, targets)
         smape = calculate_smape(outputs, targets, exclude_zeros=False)  # Include zeros during training
@@ -121,17 +121,17 @@ def evaluate(model, dataloader, criterion, device):
         progress_bar = tqdm(dataloader, desc='Evaluating')
         
         for batch_data in progress_bar:
-            if len(batch_data) == 3:
-                inputs, targets, future_features = batch_data
-                future_features = future_features.to(device)
-            else:
-                inputs, targets = batch_data
-                future_features = None
-            
+            inputs, targets, future_features, restaurant_idx, menu_idx = batch_data
+            restaurant_idx = restaurant_idx.squeeze(1).to(device)
+            menu_idx = menu_idx.squeeze(1).to(device)
+
             inputs = inputs.to(device)
             targets = targets.to(device)
+            if future_features is not None:
+                future_features = future_features.to(device)
             
-            outputs = model(inputs, target=None, teacher_forcing_ratio=0, future_features=future_features)
+            outputs = model(inputs, target=None, teacher_forcing_ratio=0, future_features=future_features,
+                           restaurant_idx=restaurant_idx, menu_idx=menu_idx)
             
             loss = criterion(outputs, targets)
             smape = calculate_smape(outputs, targets, exclude_zeros=True)  # Exclude zeros during evaluation
@@ -153,10 +153,6 @@ def main(args):
     set_seed(args.seed)
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
-    
-    # Load data
-    print("Loading preprocessed data...")
     train_data = pd.read_csv('data_preprocessed/train_preprocessed.csv')
     
     # Parse dates
@@ -228,7 +224,7 @@ def main(args):
         'output_seq_len': args.output_seq_len
     }
     
-    model = SalesPredictor(num_features, **model_config)
+    model = create_model(num_features, config=model_config, use_pretrained_embeddings=True)
     model = model.to(device)
     
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
@@ -332,7 +328,7 @@ if __name__ == "__main__":
     parser.add_argument('--dropout', type=float, default=0.2, help='Dropout rate')
     
     # Training parameters
-    parser.add_argument('--epochs', type=int, default=2, help='Number of epochs')
+    parser.add_argument('--epochs', type=int, default=3, help='Number of epochs')
     parser.add_argument('--batch_size', type=int, default=32, help='Batch size')
     parser.add_argument('--lr', type=float, default=1e-3, help='Learning rate')
     parser.add_argument('--weight_decay', type=float, default=0.01, help='Weight decay')

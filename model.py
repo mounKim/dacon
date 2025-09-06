@@ -2,24 +2,45 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+import os
+import pickle
 
-class RestaurantEmbedding(nn.Module):
-    def __init__(self, num_restaurants, embedding_dim=4):
+class PretrainedEmbedding(nn.Module):
+    def __init__(self, pretrained_weights=None, num_items=None, embedding_dim=64, trainable=False):
         super().__init__()
-        self.embedding = nn.Embedding(num_restaurants, embedding_dim)
-        nn.init.uniform_(self.embedding.weight, 0, 1)
+        if pretrained_weights is not None:
+            self.embedding = nn.Embedding.from_pretrained(
+                torch.FloatTensor(pretrained_weights),
+                freeze=not trainable
+            )
+            self.embedding_dim = pretrained_weights.shape[1]
+        else:
+            self.embedding = nn.Embedding(num_items, embedding_dim)
+            nn.init.xavier_uniform_(self.embedding.weight)
+            self.embedding_dim = embedding_dim
     
     def forward(self, x):
         return self.embedding(x)
 
-class MenuEmbedding(nn.Module):
-    def __init__(self, num_menus, embedding_dim=4):
-        super().__init__()
-        self.embedding = nn.Embedding(num_menus, embedding_dim)
-        nn.init.uniform_(self.embedding.weight, 0, 1)
+def load_pretrained_embeddings(embeddings_dir='embeddings'):
+    """Load pretrained embeddings from directory"""
+    if not os.path.exists(embeddings_dir):
+        return None, None, None, None
     
-    def forward(self, x):
-        return self.embedding(x)
+    try:
+        # Load embeddings
+        restaurant_embeddings = np.load(os.path.join(embeddings_dir, 'restaurant_embeddings.npy'))
+        menu_embeddings = np.load(os.path.join(embeddings_dir, 'menu_embeddings.npy'))
+        
+        # Load mappings
+        with open(os.path.join(embeddings_dir, 'restaurant_to_idx.pkl'), 'rb') as f:
+            restaurant_to_idx = pickle.load(f)
+        with open(os.path.join(embeddings_dir, 'menu_to_idx.pkl'), 'rb') as f:
+            menu_to_idx = pickle.load(f)
+        
+        return restaurant_embeddings, menu_embeddings, restaurant_to_idx, menu_to_idx
+    except:
+        return None, None, None, None
 
 class Attention(nn.Module):
     def __init__(self, hidden_dim):
@@ -127,7 +148,10 @@ class SalesPredictor(nn.Module):
                  num_layers=2,
                  dropout=0.2,
                  input_seq_len=28,
-                 output_seq_len=7):
+                 output_seq_len=7,
+                 restaurant_embedding=None,
+                 menu_embedding=None,
+                 use_embeddings=True):
         super().__init__()
         
         self.num_features = num_features
@@ -135,20 +159,57 @@ class SalesPredictor(nn.Module):
         self.num_layers = num_layers
         self.input_seq_len = input_seq_len
         self.output_seq_len = output_seq_len
+        self.use_embeddings = use_embeddings
         
-        self.encoder = Encoder(num_features, hidden_dim, num_layers, dropout)
-        self.decoder = Decoder(1, hidden_dim, num_features, num_layers, dropout)
+        # Add embeddings if provided
+        self.restaurant_embedding = restaurant_embedding
+        self.menu_embedding = menu_embedding
         
-        self.fc_input = nn.Linear(num_features, num_features)
-        self.layer_norm = nn.LayerNorm(num_features)
+        # Adjust feature dimension if using embeddings
+        if self.use_embeddings and restaurant_embedding and menu_embedding:
+            embedding_dim = restaurant_embedding.embedding_dim + menu_embedding.embedding_dim
+            total_features = num_features + embedding_dim
+        else:
+            total_features = num_features
         
-    def forward(self, x, target=None, teacher_forcing_ratio=0.5, future_features=None):
+        self.encoder = Encoder(total_features, hidden_dim, num_layers, dropout)
+        self.decoder = Decoder(1, hidden_dim, total_features, num_layers, dropout)
+        
+        self.fc_input = nn.Linear(total_features, total_features)
+        self.layer_norm = nn.LayerNorm(total_features)
+        self.total_features = total_features
+        
+    def forward(self, x, target=None, teacher_forcing_ratio=0.5, future_features=None,
+                restaurant_idx=None, menu_idx=None):
         """
         x: [batch_size, input_seq_len, num_features]
         target: [batch_size, output_seq_len] (only for training)
         future_features: [batch_size, output_seq_len, num_features] (should be provided for both training and inference)
+        restaurant_idx: [batch_size] restaurant indices for embedding lookup
+        menu_idx: [batch_size] menu indices for embedding lookup
         """
         batch_size = x.size(0)
+        seq_len = x.size(1)
+        
+        # Add embeddings if available
+        if self.use_embeddings and self.restaurant_embedding and self.menu_embedding and restaurant_idx is not None and menu_idx is not None:
+            # Get embeddings
+            rest_emb = self.restaurant_embedding(restaurant_idx)  # [batch_size, rest_emb_dim]
+            menu_emb = self.menu_embedding(menu_idx)  # [batch_size, menu_emb_dim]
+            
+            # Expand embeddings to match sequence length
+            rest_emb = rest_emb.unsqueeze(1).expand(-1, seq_len, -1)
+            menu_emb = menu_emb.unsqueeze(1).expand(-1, seq_len, -1)
+            
+            # Concatenate embeddings with features
+            x = torch.cat([x, rest_emb, menu_emb], dim=2)
+            
+            # Also update future_features if provided
+            if future_features is not None:
+                future_seq_len = future_features.size(1)
+                rest_emb_future = self.restaurant_embedding(restaurant_idx).unsqueeze(1).expand(-1, future_seq_len, -1)
+                menu_emb_future = self.menu_embedding(menu_idx).unsqueeze(1).expand(-1, future_seq_len, -1)
+                future_features = torch.cat([future_features, rest_emb_future, menu_emb_future], dim=2)
         
         x = self.layer_norm(self.fc_input(x))
         
@@ -203,7 +264,7 @@ class SalesDataset(torch.utils.data.Dataset):
         self.stride = stride
         
         self.feature_cols = [col for col in data.columns 
-                           if col not in ['date', 'restaurant_menu']]
+                           if col not in ['date', 'restaurant_menu', 'restaurant_idx', 'menu_idx']]
         
         self.samples = self._create_sequences()
     
@@ -218,13 +279,17 @@ class SalesDataset(torch.utils.data.Dataset):
             if len(group) < self.input_seq_len + self.output_seq_len:
                 continue
             
+            # Get restaurant and menu indices (should be same for all rows in group)
+            restaurant_idx = group['restaurant_idx'].iloc[0] if 'restaurant_idx' in group.columns else -1
+            menu_idx = group['menu_idx'].iloc[0] if 'menu_idx' in group.columns else -1
+            
             for i in range(0, len(group) - self.input_seq_len - self.output_seq_len + 1, self.stride):
                 input_seq = group.iloc[i:i + self.input_seq_len][self.feature_cols].values
                 output_seq = group.iloc[i + self.input_seq_len:i + self.input_seq_len + self.output_seq_len]['sales_count_norm'].values
                 # Add future features for the output period
                 future_features = group.iloc[i + self.input_seq_len:i + self.input_seq_len + self.output_seq_len][self.feature_cols].values
                 
-                samples.append((input_seq, output_seq, future_features))
+                samples.append((input_seq, output_seq, future_features, restaurant_idx, menu_idx))
         
         return samples
     
@@ -232,16 +297,19 @@ class SalesDataset(torch.utils.data.Dataset):
         return len(self.samples)
     
     def __getitem__(self, idx):
-        input_seq, output_seq, future_features = self.samples[idx]
-        return torch.FloatTensor(input_seq), torch.FloatTensor(output_seq), torch.FloatTensor(future_features)
+        input_seq, output_seq, future_features, restaurant_idx, menu_idx = self.samples[idx]
+        return (torch.FloatTensor(input_seq), torch.FloatTensor(output_seq), 
+                torch.FloatTensor(future_features), torch.LongTensor([restaurant_idx]), 
+                torch.LongTensor([menu_idx]))
 
-def create_model(num_features, config=None):
+def create_model(num_features, config=None, use_pretrained_embeddings=True):
     """
     Create and return the sales prediction model
     
     Args:
         num_features: number of input features
         config: optional configuration dictionary
+        use_pretrained_embeddings: whether to load and use pretrained embeddings
     """
     default_config = {
         'hidden_dim': 256,
@@ -254,13 +322,29 @@ def create_model(num_features, config=None):
     if config:
         default_config.update(config)
     
+    # Load pretrained embeddings if available
+    restaurant_embedding = None
+    menu_embedding = None
+    
+    if use_pretrained_embeddings:
+        rest_emb_weights, menu_emb_weights, _, _ = load_pretrained_embeddings()
+        if rest_emb_weights is not None and menu_emb_weights is not None:
+            restaurant_embedding = PretrainedEmbedding(rest_emb_weights, trainable=False)
+            menu_embedding = PretrainedEmbedding(menu_emb_weights, trainable=False)
+            print(f"Loaded pretrained embeddings: Restaurant {rest_emb_weights.shape}, Menu {menu_emb_weights.shape}")
+        else:
+            print("Pretrained embeddings not found, using random initialization")
+    
     model = SalesPredictor(
         num_features=num_features,
         hidden_dim=default_config['hidden_dim'],
         num_layers=default_config['num_layers'],
         dropout=default_config['dropout'],
         input_seq_len=default_config['input_seq_len'],
-        output_seq_len=default_config['output_seq_len']
+        output_seq_len=default_config['output_seq_len'],
+        restaurant_embedding=restaurant_embedding,
+        menu_embedding=menu_embedding,
+        use_embeddings=(restaurant_embedding is not None)
     )
     
     return model

@@ -8,7 +8,8 @@ import argparse
 import pickle
 import warnings
 warnings.filterwarnings('ignore')
-from model import SalesPredictor
+from model import create_model
+from embedding import load_embeddings as load_pretrained_embeddings
 import holidays
 kr_holidays = holidays.KR()
 
@@ -34,20 +35,30 @@ def load_model(checkpoint_path, device):
         'output_seq_len': 7
     })
     
-    # Determine number of features from saved model state
-    first_layer_weight = checkpoint['model_state_dict']['fc_input.weight']
-    num_features = first_layer_weight.shape[1]
+    # Check if model was trained with embeddings by looking for embedding weights
+    has_embeddings = 'restaurant_embedding.embedding.weight' in checkpoint['model_state_dict']
     
-    # Create model
-    model = SalesPredictor(num_features, **config)
+    # Determine number of base features (without embeddings) from saved model state
+    first_layer_weight = checkpoint['model_state_dict']['fc_input.weight']
+    total_features_in_model = first_layer_weight.shape[1]
+    
+    # If model has embeddings, we need to subtract embedding dimensions
+    if has_embeddings:
+        # 64 + 64 = 128 embedding dimensions
+        num_features = total_features_in_model - 32  # This gives us the base features
+    else:
+        num_features = total_features_in_model
+    
+    # Create model - it will add embeddings if needed
+    model = create_model(num_features, config=config, use_pretrained_embeddings=has_embeddings)
     
     # Try to load state dict
     try:
         model.load_state_dict(checkpoint['model_state_dict'])
-        print("Model loaded successfully with new structure")
+        print("Model loaded successfully with embeddings")
     except RuntimeError as e:
         print(f"Warning: Model structure mismatch. Error: {e}")
-        print("This model was trained with old structure. Consider retraining for better performance.")
+        print("Attempting partial load...")
         # Load what we can, ignore mismatched layers
         model_dict = model.state_dict()
         pretrained_dict = checkpoint['model_state_dict']
@@ -65,16 +76,37 @@ def load_model(checkpoint_path, device):
     
     return model, config
 
-def prepare_input_sequence(test_df, feature_cols):
+def prepare_input_sequence(test_df, feature_cols, restaurant_to_idx=None, menu_to_idx=None):
     """Prepare last 28 days of data for each restaurant_menu"""
     sequences = {}
     future_features_dict = {}
+    indices_dict = {}
     
     grouped = test_df.groupby('restaurant_menu')
     for name, group in grouped:
         group = group.sort_values('date').reset_index(drop=True)
         
-        last_28_days = group.tail(28)[feature_cols].values
+        # Get indices for restaurant and menu
+        if restaurant_to_idx and menu_to_idx:
+            # Split restaurant_menu to get restaurant and menu
+            parts = name.split('_', 1)
+            if len(parts) == 2:
+                restaurant, menu = parts
+                rest_idx = restaurant_to_idx.get(restaurant, 0)
+                menu_idx = menu_to_idx.get(menu, 0)
+            else:
+                rest_idx = 0
+                menu_idx = 0
+        else:
+            rest_idx = group['restaurant_idx'].iloc[0] if 'restaurant_idx' in group.columns else 0
+            menu_idx = group['menu_idx'].iloc[0] if 'menu_idx' in group.columns else 0
+        
+        indices_dict[name] = (rest_idx, menu_idx)
+        
+        # Filter feature_cols to exclude restaurant_idx and menu_idx
+        filtered_cols = [col for col in feature_cols if col not in ['restaurant_idx', 'menu_idx']]
+        
+        last_28_days = group.tail(28)[filtered_cols].values
         sequences[name] = torch.FloatTensor(last_28_days).unsqueeze(0)  # Add batch dimension
         
         # Prepare future features for next 7 days
@@ -90,18 +122,20 @@ def prepare_input_sequence(test_df, feature_cols):
             
             # Update weekday encoding
             # First, reset all weekday columns to 0
-            weekday_cols = [i for i, col in enumerate(feature_cols) if col.startswith('weekday_')]
+            weekday_cols = [i for i, col in enumerate(filtered_cols) if col.startswith('weekday_')]
             for idx in weekday_cols:
                 future_day_features[idx] = 0
             
             # Set the correct weekday to 1
             future_date = last_date + pd.Timedelta(days=day+1)
-            weekday_idx = [i for i, col in enumerate(feature_cols) if col == f'weekday_{future_date.dayofweek}'][0]
-            future_day_features[weekday_idx] = 1
+            weekday_col = f'weekday_{future_date.dayofweek}'
+            if weekday_col in filtered_cols:
+                weekday_idx = [i for i, col in enumerate(filtered_cols) if col == weekday_col][0]
+                future_day_features[weekday_idx] = 1
             
             # Update holiday feature (1 if holiday or weekend, 0 otherwise)
-            if 'holiday' in feature_cols:
-                holiday_idx = [i for i, col in enumerate(feature_cols) if col == 'holiday'][0]
+            if 'holiday' in filtered_cols:
+                holiday_idx = [i for i, col in enumerate(filtered_cols) if col == 'holiday'][0]
                 future_day_features[holiday_idx] = 1 if future_date.date() in kr_holidays or future_date.weekday() >= 5 else 0
             
             # Sales count will be updated during prediction
@@ -111,7 +145,7 @@ def prepare_input_sequence(test_df, feature_cols):
         
         future_features_dict[name] = torch.FloatTensor(np.array(future_features)).unsqueeze(0)
         
-    return sequences, future_features_dict
+    return sequences, future_features_dict, indices_dict
 
 def denormalize_predictions(predictions, menu_scalers, restaurant_menu_list):
     """Denormalize predictions back to original scale"""
@@ -202,8 +236,16 @@ def main(args):
         # Get feature columns (excluding date and restaurant_menu)
         feature_cols = [col for col in test_df.columns if col not in ['date', 'restaurant_menu']]
         
+        # Load embedding mappings if available
+        try:
+            _, _, restaurant_to_idx, menu_to_idx = load_pretrained_embeddings()
+        except:
+            restaurant_to_idx = None
+            menu_to_idx = None
+        
         # Prepare input sequences and future features
-        input_sequences, future_features_dict = prepare_input_sequence(test_df, feature_cols)
+        input_sequences, future_features_dict, indices_dict = prepare_input_sequence(
+            test_df, feature_cols, restaurant_to_idx, menu_to_idx)
         
         # Make predictions
         predictions = {}
@@ -212,8 +254,15 @@ def main(args):
                 input_seq = input_seq.to(device)
                 future_features = future_features_dict[restaurant_menu].to(device)
                 
-                # Model prediction with future features
-                output = model(input_seq, target=None, teacher_forcing_ratio=0, future_features=future_features)
+                # Get restaurant and menu indices
+                rest_idx, menu_idx = indices_dict.get(restaurant_menu, (0, 0))
+                rest_idx_tensor = torch.LongTensor([rest_idx]).to(device)
+                menu_idx_tensor = torch.LongTensor([menu_idx]).to(device)
+                
+                # Model prediction with future features and embeddings
+                output = model(input_seq, target=None, teacher_forcing_ratio=0, 
+                             future_features=future_features,
+                             restaurant_idx=rest_idx_tensor, menu_idx=menu_idx_tensor)
                 output = output.squeeze().cpu().numpy()
                 
                 predictions[restaurant_menu] = output

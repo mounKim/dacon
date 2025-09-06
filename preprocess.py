@@ -6,7 +6,7 @@ from sklearn.preprocessing import MinMaxScaler
 from datetime import datetime
 import glob
 import os
-from model import RestaurantEmbedding, MenuEmbedding
+import pickle
 import holidays
 kr_holidays = holidays.KR()
 
@@ -45,19 +45,52 @@ def preprocess_data():
     all_df['restaurant_idx'] = all_df['restaurant'].map(restaurant_to_idx)
     all_df['menu_idx'] = all_df['menu'].map(menu_to_idx)
     
-    restaurant_model = RestaurantEmbedding(len(unique_restaurants))
-    menu_model = MenuEmbedding(len(unique_menus))
-    
-    with torch.no_grad():
-        restaurant_indices = torch.LongTensor(all_df['restaurant_idx'].values)
-        restaurant_embeddings = restaurant_model(restaurant_indices).numpy()
-        
-        menu_indices = torch.LongTensor(all_df['menu_idx'].values)
-        menu_embeddings = menu_model(menu_indices).numpy()
-    
-    for i in range(4):
-        all_df[f'restaurant_emb_{i}'] = restaurant_embeddings[:, i]
-        all_df[f'menu_emb_{i}'] = menu_embeddings[:, i]
+    # Try to load pretrained embeddings
+    try:
+        if os.path.exists('embeddings/restaurant_embeddings.npy'):
+            print("Loading pretrained embeddings...")
+            restaurant_embeddings = np.load('embeddings/restaurant_embeddings.npy')
+            menu_embeddings = np.load('embeddings/menu_embeddings.npy')
+            
+            # Load mappings to ensure consistency
+            with open('embeddings/restaurant_to_idx.pkl', 'rb') as f:
+                pretrained_rest_to_idx = pickle.load(f)
+            with open('embeddings/menu_to_idx.pkl', 'rb') as f:
+                pretrained_menu_to_idx = pickle.load(f)
+            
+            # Use pretrained mappings if they match
+            if set(pretrained_rest_to_idx.keys()) == set(unique_restaurants):
+                restaurant_to_idx = pretrained_rest_to_idx
+                all_df['restaurant_idx'] = all_df['restaurant'].map(restaurant_to_idx)
+            
+            if set(pretrained_menu_to_idx.keys()) == set(unique_menus):
+                menu_to_idx = pretrained_menu_to_idx
+                all_df['menu_idx'] = all_df['menu'].map(menu_to_idx)
+            
+            # Get embeddings for each row
+            rest_emb_dim = restaurant_embeddings.shape[1]
+            menu_emb_dim = menu_embeddings.shape[1]
+            
+            # Create embedding columns (using first 4 dimensions for backward compatibility)
+            for i in range(min(4, rest_emb_dim)):
+                all_df[f'restaurant_emb_{i}'] = all_df['restaurant_idx'].map(
+                    lambda idx: restaurant_embeddings[idx, i] if idx < len(restaurant_embeddings) else 0
+                )
+            
+            for i in range(min(4, menu_emb_dim)):
+                all_df[f'menu_emb_{i}'] = all_df['menu_idx'].map(
+                    lambda idx: menu_embeddings[idx, i] if idx < len(menu_embeddings) else 0
+                )
+        else:
+            raise FileNotFoundError("Embeddings not found")
+    except Exception as e:
+        print(f"Could not load pretrained embeddings: {e}")
+        print("Using random embeddings...")
+        # Random embeddings as fallback
+        np.random.seed(42)
+        for i in range(4):
+            all_df[f'restaurant_emb_{i}'] = np.random.uniform(0, 1, len(all_df))
+            all_df[f'menu_emb_{i}'] = np.random.uniform(0, 1, len(all_df))
     
     # Load all weather data (train + test)
     train_weather_df = pd.read_csv('data/train/meta/TRAIN_weather.csv')
@@ -117,7 +150,8 @@ def preprocess_data():
                [f'menu_emb_{i}' for i in range(4)] + \
                ['avg_temp_norm', 'rainfall_norm']
     
-    train_processed = train_processed[['date', 'restaurant_menu'] + features]
+    # Also include restaurant_idx and menu_idx for embedding lookup
+    train_processed = train_processed[['date', 'restaurant_menu', 'restaurant_idx', 'menu_idx'] + features]
     
     os.makedirs('data_preprocessed', exist_ok=True)
     
@@ -131,19 +165,14 @@ def preprocess_data():
         test_processed = all_df[all_df['date'].isin(test_df_orig['date']) & 
                                 all_df['restaurant_menu'].isin(test_df_orig['restaurant_menu'])].copy()
         
-        test_processed = test_processed[['date', 'restaurant_menu'] + features]
+        test_processed = test_processed[['date', 'restaurant_menu', 'restaurant_idx', 'menu_idx'] + features]
         
         output_filename = f'data_preprocessed/{test_name}_preprocessed.csv'
         test_processed.to_csv(output_filename, index=False)
         print(f"Saved {output_filename}")
     
-    # Save with pickle compatibility for scikit-learn objects
-    import pickle
-    
-    # Save PyTorch models separately
+    # Save mappings and scalers
     torch.save({
-        'restaurant_model': restaurant_model.state_dict(),
-        'menu_model': menu_model.state_dict(),
         'restaurant_to_idx': restaurant_to_idx,
         'menu_to_idx': menu_to_idx,
     }, 'data_preprocessed/embedding_models.pt')
